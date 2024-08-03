@@ -1,0 +1,12 @@
+[package]
+name = "diesel_repo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.8.0"
+jsonapi = { git = "https://github.com/qmuloadmin/jsonapi", features=["actixweb"] }
+async-trait = "0.1.81"
+diesel = { version = "2.2.2", features = ["postgres", "r2d2"] }
+diesel_migrations = "2.2.0"
+r2d2 = "0.8.10"
