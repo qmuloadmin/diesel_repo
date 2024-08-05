@@ -118,6 +118,14 @@ impl RepoError {
             cause: None,
         }
     }
+
+	pub fn new_conflict(message: &str) -> Self {
+		RepoError {
+			reason: Reason::Conflict,
+			message: format!("conflict: {}", message),
+			cause: None,
+		}
+	}
 }
 
 #[derive(Clone)]
