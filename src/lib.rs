@@ -119,13 +119,13 @@ impl RepoError {
         }
     }
 
-	pub fn new_conflict(message: &str) -> Self {
-		RepoError {
-			reason: Reason::Conflict,
-			message: format!("conflict: {}", message),
-			cause: None,
-		}
-	}
+    pub fn new_conflict(message: &str) -> Self {
+        RepoError {
+            reason: Reason::Conflict,
+            message: format!("conflict: {}", message),
+            cause: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -140,10 +140,13 @@ impl ConnPool {
         hostname: String,
         username: String,
         password: String,
-		database: String,
+        database: String,
         migs: EmbeddedMigrations,
     ) -> Self {
-        let url = format!("postgres://{}:{}@{}/{}", username, password, hostname, database);
+        let url = format!(
+            "postgres://{}:{}@{}/{}",
+            username, password, hostname, database
+        );
         let mut mig_con = PgConnection::establish(&url).unwrap();
         println!("Running pending migrations");
         mig_con.run_pending_migrations(migs).unwrap();
@@ -167,7 +170,7 @@ where
     Self: HasTable + Sized,
 {
     type Resource: Send;
-    type Id: Send;
+    type Id: Send + Clone;
     // Leave these as Unimplemented if needed and unimplemented. There's probably a better way to do this, but
     // for now, this unlocks default generics on the various child traits (e.g. CRRepository)
     // as well as auto implement generic traits
@@ -248,6 +251,7 @@ pub trait ActixWebURepository<
     U: Send + 'static,
     Self::Table: LimitDsl + FindDsl<Self::Id>, // to get a find method on table
     Find<Self::Table, Self::Id>: LimitDsl,     // to get find results
+    Limit<Find<Self::Table, Self::Id>>: LoadQuery<'static, PgConnection, Self::Resource>, // for select fallback on no changes
     <Self::Table as FindDsl<Self::Id>>::Output: IntoUpdateTarget, // for update on find results
     UpdateStatement<
         <<Self::Table as FindDsl<Self::Id>>::Output as HasTable>::Table,
@@ -306,6 +310,7 @@ impl<Repo: URepository<U, R, B>, U: Send + 'static, R: Send + 'static, B>
 where
     Repo::Table: LimitDsl + FindDsl<Repo::Id>, // to get a find method on table
     Find<Repo::Table, Repo::Id>: LimitDsl,     // to get find results
+    Limit<Find<Self::Table, Self::Id>>: LoadQuery<'static, PgConnection, Self::Resource>, // for select fallback on no changes
     <Repo::Table as FindDsl<Repo::Id>>::Output: IntoUpdateTarget, // for update on find results
     UpdateStatement<
         <<Repo::Table as FindDsl<Repo::Id>>::Output as HasTable>::Table,
@@ -366,23 +371,32 @@ pub trait CRepository<
 // This is essentially a from trait, but enriched to support performing database queries during the conversion
 // to allow for needing to insert other related elements
 pub trait IntoResourceType<R> {
-	fn into_resource(self, ctx: &mut PgConnection) -> Result<R, RepoError>;
+    fn into_resource(self, ctx: &mut PgConnection) -> Result<R, RepoError>;
 }
 
-impl<R, T> IntoResourceType<R> for T where R: From<T> {
-	fn into_resource(self, _: &mut PgConnection) -> Result<R, RepoError> {
-		Ok(R::from(self))
-	}
+impl<R, T> IntoResourceType<R> for T
+where
+    R: From<T>,
+{
+    fn into_resource(self, _: &mut PgConnection) -> Result<R, RepoError> {
+        Ok(R::from(self))
+    }
 }
 
-pub trait FromResource<R> where Self: Sized {
-	fn from_resource(ctx: &mut PgConnection, res: R) -> Result<Self, RepoError>;
+pub trait FromResource<R>
+where
+    Self: Sized,
+{
+    fn from_resource(ctx: &mut PgConnection, res: R) -> Result<Self, RepoError>;
 }
 
-impl<R, T> FromResource<R> for T where T: From<R> {
-	fn from_resource(_: &mut PgConnection, res: R) -> Result<Self, RepoError> {
-		Ok(Self::from(res))
-	}
+impl<R, T> FromResource<R> for T
+where
+    T: From<R>,
+{
+    fn from_resource(_: &mut PgConnection, res: R) -> Result<Self, RepoError> {
+        Ok(Self::from(res))
+    }
 }
 
 pub trait RRepository<R = <Self as Repository>::Resource>: Repository + Sized
@@ -479,10 +493,10 @@ where
         conn: &mut PgConnection,
         results: Vec<Self::Resource>,
     ) -> Result<Vec<R>, RepoError> {
-		let mut converted = Vec::with_capacity(results.len());
-		for each in results.into_iter() {
-			converted.push(R::from_resource(conn, each)?);
-		}
+        let mut converted = Vec::with_capacity(results.len());
+        for each in results.into_iter() {
+            converted.push(R::from_resource(conn, each)?);
+        }
         Ok(converted)
     }
 }
@@ -494,6 +508,7 @@ pub trait URepository<
 >: Repository + Sized where
     Self::Table: LimitDsl + FindDsl<Self::Id>, // to get a find method on table
     Find<Self::Table, Self::Id>: LimitDsl,     // to get find results
+    Limit<Find<Self::Table, Self::Id>>: LoadQuery<'static, PgConnection, Self::Resource>, // for select fallback on no changes
     <Self::Table as FindDsl<Self::Id>>::Output: IntoUpdateTarget, // for update on find results
     UpdateStatement<
         <<Self::Table as FindDsl<Self::Id>>::Output as HasTable>::Table,
@@ -523,9 +538,18 @@ pub trait URepository<
                 baggage: None,
             };
             let changes = Self::pre_update(&mut ctx, &id, changes)?;
-            let resource = diesel::update(FindDsl::find(Self::table(), id))
+            let resource = match diesel::update(FindDsl::find(Self::table(), id.clone()))
                 .set(changes)
-                .get_result(&mut ctx)?;
+                .get_result(&mut ctx)
+            {
+                Ok(resource) => resource,
+                Err(diesel::result::Error::QueryBuilderError(_)) => {
+                    FindDsl::find(Self::table(), id)
+                        .limit(1)
+                        .get_result(&mut ctx)?
+                }
+                Err(err) => return Err(err.into()),
+            };
             Self::post_update(ctx, resource)
         })?)
     }
@@ -537,6 +561,7 @@ where
     R: FromResource<Repo::Resource>,
     Repo::Table: LimitDsl + FindDsl<Repo::Id>, // to get a find method on table
     Find<Repo::Table, Repo::Id>: LimitDsl,     // to get find results
+    Limit<Find<Self::Table, Self::Id>>: LoadQuery<'static, PgConnection, Self::Resource>,
     <Repo::Table as FindDsl<Repo::Id>>::Output: IntoUpdateTarget, // for update on find results
     UpdateStatement<
         <<Repo::Table as FindDsl<Repo::Id>>::Output as HasTable>::Table,
@@ -560,6 +585,6 @@ where
     }
 
     fn post_update(conn: TxnContext<Nothing>, updated: Self::Resource) -> Result<R, RepoError> {
-		R::from_resource(conn.conn, updated)
+        R::from_resource(conn.conn, updated)
     }
 }
